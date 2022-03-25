@@ -1,0 +1,60 @@
+name: build-metrics-failure-handling-test
+on:
+  push:
+    branches-ignore:
+      - "master"
+
+jobs:
+  tests:
+    name: Test failure handling
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v2.0.0
+        with:
+          files: |
+            action.yml
+            .github/workflows/build-metrics-failure-test.yml
+            .github/workflows/build-metrics-test.yml
+          # This will make the action only look for changed files since our last commit
+          # Which should prevent it from firing on every commit to a PR
+          since_last_remote_commit: "true"
+      - name: Run Custom build-metrics action with bad Github token
+        continue-on-error: true
+        # Only run this action if we've changed the relevant files
+        if: steps.changed-files.outputs.any_modified == 'true'
+        # uses here targets our action.yml
+        uses: ./
+        with:
+          # Fake values should cause errors
+          GITHUB_TOKEN: "asdf1234"
+          WORKFLOW_STATUS: "asdf1234"
+          AWS_ACCESS_KEY_ID: "asdf1234"
+          AWS_SECRET_ACCESS_KEY: "asdf1234"
+      - name: Run Custom build-metrics action with bad AWS credentials
+        continue-on-error: true
+        # Only run this action if we've changed the relevant files
+        if: steps.changed-files.outputs.any_modified == 'true'
+        # uses here targets our action.yml
+        uses: ./
+        with:
+          # Fake values should cause errors
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_STATUS: "asdf1234"
+          AWS_ACCESS_KEY_ID: "asdf1234"
+          AWS_SECRET_ACCESS_KEY: "asdf1234"
+      # And we want to log metrics for this test, too - so use a valid config
+      - name: Run Custom build-metrics action
+        if: steps.changed-files.outputs.any_modified == 'true'
+        uses: ./
+        with:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WORKFLOW_STATUS: "success"
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID}}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}

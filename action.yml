@@ -1,0 +1,264 @@
+name: "Log Build Info"
+description: "Send build information and metrics to CloudWatch logs"
+# Technically, since this is running in the context of the workflow we're
+# pulling data for, the information will be incomplete.
+# However if we run this action last, we will get the values for the previous
+# jobs, which is what we really want. This may somewhat conflate the output,
+# so we'll take an input to show what the actual status was
+
+inputs:
+  GITHUB_TOKEN:
+    description: "Github token to allow API requests. Pass in as env.GITHUB_TOKEN"
+    required: true
+  WORKFLOW_STATUS:
+    description: "`success` or `failure` based on the workflow status BEFORE this job"
+    required: true
+  AWS_ACCESS_KEY_ID:
+    description: "AWS Access Key ID for account to send metrics to"
+    required: true
+  AWS_SECRET_ACCESS_KEY:
+    description: "AWS Secret Access Key for the account to send metrics to"
+    required: true
+  AWS_REGION:
+    description: "AWS Region to use when sending metrics"
+    required: false
+    default: "us-west-2"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Prepare values
+      id: values
+      shell: bash
+      run: |
+        echo "::group::Prepare build log values"
+
+        #######  In case it's not a secret coming in, mask it
+        echo "::add-mask::${{inputs.GITHUB_TOKEN}}"
+
+        # `#*/` = only grab the value after / - so user/my-repo turns into my-repo
+        echo "::set-output name=REPO_OWNER::${{ github.repository_owner }}"
+
+        ########  GITHUB_REPOSITORY comes in as user/repo_name
+        # We want to strip the `user` bit and only get `repo_name`
+        IFS='/'
+        REPO_BASE="${{github.repository}}"
+        read -a REPO_ARR <<< "$REPO_BASE"
+        REPO_NAME=${REPO_ARR[1]}
+        echo "::set-output name=REPO_NAME::$REPO_NAME"
+
+        #######  Might cause issues if not unset
+        unset IFS
+
+        #######  If we don't get a WORKFLOW_STATUS, we should send something to indicate that
+        WORKFLOW_STATUS="${{inputs.WORKFLOW_STATUS}}"
+        if [ -n "$WORKFLOW_STATUS" ]; then
+          echo "::set-output name=WORKFLOW_STATUS::$WORKFLOW_STATUS"
+        else
+          echo "::set-output name=WORKFLOW_STATUS::undefined"
+        fi
+
+        echo "::endgroup::"
+
+    # Instead of trying to track things with multiple calls to this action
+    # For every step, let's do it per workflow with Github's API
+
+    # Disabled for the moment due to issues with format, but leaving in case ever useful
+    # - uses: actions/github-script@v5
+    #   id: get_jobs_for_workflow
+    #   env:
+    #     REPO_OWNER: ${{steps.values.outputs.REPO_OWNER}}
+    #     REPO_NAME:  ${{steps.values.outputs.REPO_NAME}}
+    #     RUN_ID: ${{github.run_id}}
+    #   with:
+    #     github-token: ${{ inputs.GITHUB_TOKEN }}
+    #     script: |
+    #       const { REPO_OWNER, REPO_NAME, RUN_ID } = process.env;
+
+    #       // if (REPO_OWNER && REPO_NAME && RUN_ID) {
+    #       try {
+    #         const jobs = await github.rest.actions.listJobsForWorkflowRun({
+    #           owner: REPO_OWNER,
+    #           repo: REPO_NAME,
+    #           run_id: RUN_ID
+    #         });
+
+    #         return jobs;
+    #       // } else {
+    #       } catch (e) {
+    #         core.error(`Error getting workflow jobs from Github API ${e}`);
+    #         return ''
+    #       }
+
+    - uses: octokit/request-action@v2.x
+      id: get_jobs_for_workflow
+      with:
+        route: GET /repos/{owner}/{repo}/actions/runs/{run_id}/jobs
+        owner: ${{steps.values.outputs.REPO_OWNER}}
+        repo: ${{steps.values.outputs.REPO_NAME}}
+        run_id: ${{github.run_id}}
+        GITHUB_TOKEN: ${{ inputs.GITHUB_TOKEN }}
+
+    - name: Prepare JSON for CloudWatch
+      shell: bash
+      run: |
+        #######  We need to setup a few things here so we can handle failure gracefully
+        #######  All of the values before now were provided by the context, these could be sent incorrectly
+
+        #######  Mask our inputs, if they're not secrets they'll be logged
+        echo "::add-mask::${{inputs.AWS_ACCESS_KEY_ID}}"
+        echo "::add-mask::${{inputs.AWS_SECRET_ACCESS_KEY}}"
+
+        ####### Setup env vars for AWS CLI
+        export AWS_ACCESS_KEY_ID="${{inputs.AWS_ACCESS_KEY_ID}}"
+        export AWS_SECRET_ACCESS_KEY="${{inputs.AWS_SECRET_ACCESS_KEY}}"
+        export AWS_REGION="${{inputs.AWS_REGION}}"
+
+
+
+        #######  Now we get and process the JSON
+        WORKFLOW_JOBS_JSON='${{steps.get_jobs_for_workflow.outputs.data}}'
+        #######  This would be from the github-scripts action we're not currently using
+        # WORKFLOW_JOBS_JSON='${{steps.get_jobs_for_workflow.outputs.result}}'
+
+        #######  If no JSON, exit early
+        if [ -z "$WORKFLOW_JOBS_JSON" ]; then
+          echo "::error title=Failure::Error getting workflow jobs from Github API - see logs for details" 
+          exit 0
+        fi
+
+        ########  Use crazy regex to fix milliseconds because it's already in this script and works
+        ########  TODO: get this working - something funky with jq or something here...
+        # WORKFLOW_END_EPOCH=$(echo "$WORKFLOW_JOBS_JSON" | jq -r '.jobs[-2].steps[-1].completed_at | sub("(?<time>.*)\\.[\\d]{3}(?<tz>.*)"; "\(.time)\(.tz)") | fromdateiso8601')
+
+        ########  This is the end
+        NOW=$(date +%s)
+
+        ########  And get the first job's start time as our start - -r to get raw (non-quoted) value
+        WORKFLOW_START_STRING=$(echo "$WORKFLOW_JOBS_JSON" | jq -r '.jobs[0].started_at')
+        WORKFLOW_START_EPOCH=$(date -d"$WORKFLOW_START_STRING" +%s)
+
+        ########  Get our workflow diff in seconds
+        WORKFLOW_DIFF=$(($NOW - $WORKFLOW_START_EPOCH))
+
+        ########  Group these logs, they're ugly
+        echo "::group::Parse JSON From Github API"
+        ########  Using this weird {}|{} thing to preserve comments, this is a doozy
+        echo "$WORKFLOW_JOBS_JSON" | {
+          #
+          ########  Workflow is still running, but at this point we know everything has 
+          ########  run except this logging step, so we can flag it success
+          ########  TODO: better way to do this? How do we collect metrics for the logging step?
+          #
+          jq --arg status "${{steps.values.outputs.WORKFLOW_STATUS}}" '. += {"workflow_status": $status}' 
+        } | {
+          jq --arg workflow_diff "$WORKFLOW_DIFF" '. += {"workflow_time_elapsed": $workflow_diff}'
+        } | {
+          #
+          ########  Add our repo name in
+          #
+          jq --arg repo_name "#{{steps.values.outputs.REPO_NAME}}" '. += {"repo_name": $repo_name}'
+        } | {
+          #
+          ########  Add the step_count property since it doesn't exist
+          ########  `|= . + ` is jq for "add to the array" - have to wrap in object because arr is objects
+          #
+          jq '.jobs[] |= . + {"step_count": .steps | length}'
+        } | {
+          #
+          ########  Go ahead and add some timing, too, since that'll be important
+          ########  Lord help me, this concoction gives us the completion time in seconds
+          ########  We add to the array via map so we can add a property, then we make sure
+          ########  that we're not checking items with `null` values (IE this step in a workflow run)
+          ########  Then we have to correct for millisecond precision coming from the GH API for step
+          ########  times, for whatever reason (workflow uses second precision?) with the sub() regex stuff
+          ########  then we turn it into epoch and do some subtraction. `completion_seconds = null` if times are null
+          #
+          jq '.jobs[].steps |= map(.completion_seconds = (if .completed_at != null and .started_at != null then((.completed_at | sub("(?<time>.*)\\.[\\d]{3}(?<tz>.*)"; "\(.time)\(.tz)") | fromdateiso8601 ) - (.started_at | sub("(?<time>.*)\\.[\\d]{3}(?<tz>.*)"; "\(.time)\(.tz)") | fromdateiso8601)) else null end))'
+        } | {
+          #
+          ########  We also need a format of {timestamp: 1234567890000, message: "{...}"} (millisecond precision)
+          ########  $RUNNER_TEMP is a /tmp dir for the runner that we can write to during a run, cleared after
+          #
+          jq --arg timestamp "$NOW" '[{ timestamp: (($timestamp | tonumber) * 1000), message: (. | tostring) }]' > $RUNNER_TEMP/build_log.json
+        }
+        echo "::endgroup::"
+
+    - name: Log Build
+      shell: bash
+      run: |
+        #######  Github uses fail fast by default, we don't want that
+        # set +e
+        echo "::group::Send build logs to CloudWatch"
+
+        #######  Setup env vars for AWS CLI
+        #######  All of the values before now were provided by the context, these could be sent incorrectly
+        #######  and cause job failures. Mask our inputs, if they're not secrets they'll be logged plaintext
+        echo "::add-mask::${{inputs.AWS_ACCESS_KEY_ID}}"
+        echo "::add-mask::${{inputs.AWS_SECRET_ACCESS_KEY}}"
+
+        export AWS_ACCESS_KEY_ID="${{inputs.AWS_ACCESS_KEY_ID}}"
+        export AWS_SECRET_ACCESS_KEY="${{inputs.AWS_SECRET_ACCESS_KEY}}"
+        export AWS_REGION="${{inputs.AWS_REGION}}"
+
+
+        ########  Setup retry options for the AWS CLI - adaptive mode is experimental but should handle this well.
+        ########  We do this because of rate limits on create-log-stream, put-log-events should never have issues
+        ########  create-log-stream limit: 50 transactions per second, after which transactions are throttled.
+        ########  see https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-retries.html
+        AWS_RETRY_MODE=adaptive
+        AWS_MAX_ATTEMPTS=6
+
+        ########  First, we have to name and create our log stream
+        ########  This should guarantee a unique name because run_number is per run, date is second precision
+        LOG_STREAM_NAME="${{steps.values.outputs.REPO_NAME}}-${{github.workflow}}-${{github.run_id}}-${{github.run_number}}-$(date +%s)" 
+
+        #######  Catch exit status of the sendlogs function so we can fail gracefully
+        # $(command 2>&1) && exit_status=$? || exit_status=$?
+
+        echo "Creating log stream $LOG_STREAM_NAME"
+        createoutput=$(aws logs create-log-stream \
+        --log-group-name "/github/actions/pipelines" \
+        --log-stream-name "$LOG_STREAM_NAME" 2>&1) && cls_exit_status=$? || cls_exit_status=$?
+
+        if [ "$cls_exit_status" = 0 ]; then
+          #######  Add a debug log so we know things worked 
+          echo "Created log stream in CloudWatch successfully"
+        else
+          #######  Set an error message in the workflow log and annotate the UI
+          echo "Error creating log stream in CloudWatch"
+          echo "$createoutput"
+          echo "::error file=build-metrics/action.yml,title=Failure::Failed to create log stream (invalid credentials?)" 
+        fi
+
+
+        ########  We shouldn't need to worry about `nextSequenceToken` because each log stream will be new
+        ########  This slaps the JSON into CloudWatch, then we can query it.
+        echo "Sending logs to log stream $LOG_STREAM_NAME"
+        putoutput=$(aws logs put-log-events \
+        --log-group-name "/github/actions/pipelines" \
+        --log-stream-name "$LOG_STREAM_NAME" \
+        --log-events file://$RUNNER_TEMP/build_log.json 2>&1) && ple_exit_status=$? || ple_exit_status=$?
+
+        if [ "$ple_exit_status" = 0 ]; then
+          #######  Add a debug log so we know things worked 
+          echo "Sent logs to CloudWatch successfully"
+          echo "::debug::Sent logs to CloudWatch successfully" 
+        else
+          #######  Set an error message in the workflow log and annotate the UI
+          echo "Error sending logs to CloudWatch"
+          echo "$putoutput"
+          echo "::error file=build-metrics/action.yml,title=Failure::Failed to send logs (missing/invalid AWS credentials?)" 
+        fi
+
+        echo "Done, exiting"
+        echo "::endgroup::"
+        set -e
+        exit 0
+
+    # We dont' want to fail the whole workflow run if we somehow fail the above
+    # We lose metrics, but that's better than wasting dev time and build minutes on re-runs
+    - name: Fail successfully
+      if: failure()
+      shell: bash
+      run: echo "Failed to send metrics" && exit 0

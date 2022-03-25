@@ -1,0 +1,39 @@
+name: build-metrics-base-test
+on:
+  push:
+    branches-ignore:
+      - "master"
+
+jobs:
+  tests:
+    name: Test workflow
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v2.0.0
+        with:
+          files: |
+            build-metrics/ 
+            .github/workflows/build-metrics-failure-test.yml
+            .github/workflows/build-metrics-test.yml
+          # This will make the action only look for changed files since our last commit
+          # Which should prevent it from firing on every commit to a PR
+          since_last_remote_commit: "true"
+      - name: Run Custom build-metrics action
+        # Only run this action if we've changed the relevant files
+        if: steps.changed-files.outputs.any_modified == 'true'
+        # uses here targets our build-metrics/action.yml
+        uses: ./build-metrics/
+        with:
+          GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
+          # Normally, we'd compute this
+          WORKFLOW_STATUS: "success"
+          AWS_ACCESS_KEY_ID: ${{secrets.AWS_ACCESS_KEY_ID_PROD}}
+          AWS_SECRET_ACCESS_KEY: ${{secrets.AWS_SECRET_ACCESS_KEY_PROD}}
+      # TODO: pull logs from CW to verify data?
